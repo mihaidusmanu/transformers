@@ -30,6 +30,7 @@ from ...modeling_utils import PreTrainedModel
 from ...utils import ModelOutput, auto_docstring, is_vision_available, logging, torch_int
 from .configuration_owlvit import OwlViTConfig, OwlViTTextConfig, OwlViTVisionConfig
 
+from flash_attn import flash_attn_func
 
 if is_vision_available():
     from transformers.image_transforms import center_to_corners_format
@@ -413,7 +414,16 @@ class OwlViTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        # attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        q_flash = query_states.view(bsz, -1, self.num_heads, self.head_dim)
+        k_flash = key_states.view(bsz, -1, self.num_heads, self.head_dim) 
+        v_flash = value_states.view(bsz, -1, self.num_heads, self.head_dim)
+
+        # Flash attention call
+        attn_output = flash_attn_func(q_flash, k_flash, v_flash, dropout_p=0.0, causal=False)
+
+        # Reshape back to expected output format
+        attn_output = attn_output.view(bsz * self.num_heads, -1, self.head_dim)
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
