@@ -412,78 +412,64 @@ class OwlViTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        # attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        # Reshape from (bsz * num_heads, seq_len, head_dim) to (bsz, seq_len, num_heads, head_dim)
-        q_flash = query_states.view(bsz, self.num_heads, src_len, self.head_dim).transpose(1, 2)
-        k_flash = key_states.view(bsz, self.num_heads, src_len, self.head_dim).transpose(1, 2)
-        v_flash = value_states.view(bsz, self.num_heads, src_len, self.head_dim).transpose(1, 2)
+        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                f" {attn_weights.size()}"
+            )
 
-        # Flash attention call
-        attn_weights = flash_attn_func(q_flash, k_flash, v_flash, dropout_p=0.0, causal=True)
+        # apply the causal_attention_mask first
+        if causal_attention_mask is not None:
+            if causal_attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is"
+                    f" {causal_attention_mask.size()}"
+                )
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + causal_attention_mask
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        # Reshape back to expected output format
-        attn_output = attn_weights.reshape(bsz, src_len, self.num_heads * self.head_dim)
-        # if attention_mask is not None:
-        #     print(attention_mask.mean())
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        # if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
-        #     raise ValueError(
-        #         f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
-        #         f" {attn_weights.size()}"
-        #     )
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-        # # apply the causal_attention_mask first
-        # if causal_attention_mask is not None:
-        #     if causal_attention_mask.size() != (bsz, 1, tgt_len, src_len):
-        #         raise ValueError(
-        #             f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is"
-        #             f" {causal_attention_mask.size()}"
-        #         )
-        #     attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + causal_attention_mask
-        #     attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+        if output_attentions:
+            # this operation is a bit akward, but it's required to
+            # make sure that attn_weights keeps its gradient.
+            # In order to do so, attn_weights have to reshaped
+            # twice and have to be reused in the following
+            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+        else:
+            attn_weights_reshaped = None
 
-        # if attention_mask is not None:
-        #     if attention_mask.size() != (bsz, 1, tgt_len, src_len):
-        #         raise ValueError(
-        #             f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
-        #         )
-        #     attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-        #     attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-        # attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        # For int8 compatibility, sometimes the `attn_probs` are in `fp32`
+        attn_probs = attn_probs.to(value_states.dtype)
 
-        # if output_attentions:
-        #     # this operation is a bit akward, but it's required to
-        #     # make sure that attn_weights keeps its gradient.
-        #     # In order to do so, attn_weights have to reshaped
-        #     # twice and have to be reused in the following
-        #     attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-        #     attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
-        # else:
-        #     attn_weights_reshaped = None
+        attn_output = torch.bmm(attn_probs, value_states)
 
-        # attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
 
-        # # For int8 compatibility, sometimes the `attn_probs` are in `fp32`
-        # attn_probs = attn_probs.to(value_states.dtype)
-
-        # attn_output = torch.bmm(attn_probs, value_states)
-
-        # if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
-        #     raise ValueError(
-        #         f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is"
-        #         f" {attn_output.size()}"
-        #     )
-
-        # attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
-        # attn_output = attn_output.transpose(1, 2)
-        # attn_output = attn_output.reshape(bsz, tgt_len, embed_dim)
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(bsz, tgt_len, embed_dim)
 
         attn_output = self.out_proj(attn_output)
 
-        return attn_output, None
-
+        return attn_output, attn_weights_reshaped
 
 # Copied from transformers.models.clip.modeling_clip.CLIPMLP with CLIP->OwlViT
 class OwlViTMLP(nn.Module):

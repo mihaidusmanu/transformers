@@ -423,7 +423,10 @@ class Owlv2Attention(nn.Module):
         # prepare full attention mask
         full_attention_mask = None
         if attention_mask is not None and causal_attention_mask is not None:
-            full_attention_mask = torch.logical_and(attention_mask != 0, causal_attention_mask != 0)
+            full_attention_mask = causal_attention_mask + attention_mask
+            # clip to remove -infs
+            full_attention_mask = torch.clip(full_attention_mask, causal_attention_mask.min(), causal_attention_mask.max())
+            full_attention_mask = torch.logical_or(causal_attention_mask, attention_mask)
         elif attention_mask is not None:
             full_attention_mask = attention_mask != 0
         elif causal_attention_mask is not None:
