@@ -416,7 +416,7 @@ class Owlv2Attention(nn.Module):
         bsz, seq_len, _ = hidden_states.size()
 
         # get query proj
-        query_states = self._shape(self.q_proj(hidden_states) * self.scale, -1, bsz)
+        query_states = self._shape(self.q_proj(hidden_states), -1, bsz)
         key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
         value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
@@ -426,11 +426,11 @@ class Owlv2Attention(nn.Module):
             full_attention_mask = causal_attention_mask + attention_mask
             # clip to remove -infs
             full_attention_mask = torch.clip(full_attention_mask, causal_attention_mask.min(), causal_attention_mask.max())
-            full_attention_mask = torch.logical_or(causal_attention_mask, attention_mask)
+            full_attention_mask = torch.logical_not(torch.logical_or(causal_attention_mask != 0, attention_mask != 0))
         elif attention_mask is not None:
-            full_attention_mask = attention_mask != 0
+            full_attention_mask = torch.logical_not(attention_mask != 0)
         elif causal_attention_mask is not None:
-            full_attention_mask = causal_attention_mask != 0
+            full_attention_mask = torch.logical_not(causal_attention_mask != 0)
         
         attn_output = scaled_dot_product_attention(
             query_states,
@@ -438,6 +438,7 @@ class Owlv2Attention(nn.Module):
             value_states,
             attn_mask=full_attention_mask,
             dropout_p=self.dropout if self.training else 0.0,
+            scale=self.scale
         )
 
         # reshape back to expected output format
