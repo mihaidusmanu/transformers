@@ -423,7 +423,7 @@ class OwlViTAttention(nn.Module):
         attn_output = flash_attn_func(q_flash, k_flash, v_flash, dropout_p=0.0, causal=False)
 
         # Reshape back to expected output format
-        attn_output = attn_output.view(bsz * self.num_heads, -1, self.head_dim)
+        attn_weights = attn_output.view(bsz * self.num_heads, -1, self.head_dim)
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
