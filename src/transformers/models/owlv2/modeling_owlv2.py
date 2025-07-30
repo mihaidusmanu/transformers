@@ -421,6 +421,7 @@ class Owlv2Attention(nn.Module):
         value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
         # prepare full attention mask
+        # TODO(WIP): debug floating point masks
         full_attention_mask = None
         if attention_mask is not None and causal_attention_mask is not None:
             full_attention_mask = causal_attention_mask + attention_mask
