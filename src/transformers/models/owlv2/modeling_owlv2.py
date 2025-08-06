@@ -387,16 +387,50 @@ def eager_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
-    attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
+    bsz, num_heads, seq_len, head_dim = query.shape
+    proj_shape = (bsz * num_heads, -1, head_dim)
+    query = query.reshape(proj_shape)
+    key = key.reshape(proj_shape)
+    value = value.reshape(proj_shape)
+
+    attn_weights = torch.bmm(query, key.transpose(1, 2)) * scaling
+
+    if attn_weights.size() != (bsz * num_heads, seq_len, seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz * num_heads, seq_len, seq_len)}, but is {attn_weights.size()}"
+        )
+
     if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
+        if attention_mask.size() != (bsz, 1, seq_len, seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, seq_len, seq_len)}, but is {attention_mask.size()}"
+            )
+        attn_weights = attn_weights.view(bsz, num_heads, seq_len, seq_len) + attention_mask
+        attn_weights = attn_weights.view(bsz * num_heads, seq_len, seq_len)
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    # this operation is a bit akward, but it's required to
+    # make sure that attn_weights keeps its gradient.
+    # In order to do so, attn_weights have to reshaped
+    # twice and have to be reused in the following
+    attn_weights_reshaped = attn_weights.view(bsz, num_heads, seq_len, seq_len)
+    attn_weights = attn_weights_reshaped.view(bsz * num_heads, seq_len, seq_len)
 
+    attn_probs = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    # For int8 compatibility, sometimes the `attn_probs` are in `fp32`
+    attn_probs = attn_probs.to(value.dtype)
+
+    attn_output = torch.bmm(attn_probs, value)
+
+    if attn_output.size() != (bsz * num_heads, seq_len, head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, num_heads, seq_len, head_dim)}, but is {attn_output.size()}"
+        )
+
+    attn_output = attn_output.view(bsz, num_heads, seq_len, head_dim)
+    attn_output = attn_output.transpose(1, 2)
     return attn_output, attn_weights
 
 
