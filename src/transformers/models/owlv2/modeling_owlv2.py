@@ -16,18 +16,17 @@
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.utils.checkpoint
 from torch import Tensor, nn
-from torch.nn.functional import scaled_dot_product_attention
 
 from ...activations import ACT2FN
 from ...modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
-from ...modeling_utils import PreTrainedModel
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...utils import ModelOutput, auto_docstring, is_vision_available, logging, torch_int
 from .configuration_owlv2 import Owlv2Config, Owlv2TextConfig, Owlv2VisionConfig
 
@@ -378,6 +377,29 @@ class Owlv2TextEmbeddings(nn.Module):
         return embeddings
 
 
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
 # Copied from transformers.models.owlvit.modeling_owlvit.OwlViTAttention with OwlViT->Owlv2
 class Owlv2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -415,39 +437,41 @@ class Owlv2Attention(nn.Module):
 
         bsz, seq_len, _ = hidden_states.size()
 
-        # get query proj
-        query_states = self._shape(self.q_proj(hidden_states), -1, bsz)
-        key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-        value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+        queries = self._shape(self.q_proj(hidden_states), -1, bsz)
+        keys = self._shape(self.k_proj(hidden_states), -1, bsz)
+        values = self._shape(self.v_proj(hidden_states), -1, bsz)
 
-        # prepare full attention mask
-        # TODO(WIP): debug floating point masks
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
         full_attention_mask = None
         if attention_mask is not None and causal_attention_mask is not None:
-            full_attention_mask = causal_attention_mask + attention_mask
-            # clip to remove -infs
-            full_attention_mask = torch.clip(full_attention_mask, causal_attention_mask.min(), causal_attention_mask.max())
-            full_attention_mask = torch.logical_not(torch.logical_or(causal_attention_mask != 0, attention_mask != 0))
+            full_attention_mask = attention_mask + causal_attention_mask
         elif attention_mask is not None:
-            full_attention_mask = torch.logical_not(attention_mask != 0)
+            full_attention_mask = attention_mask
         elif causal_attention_mask is not None:
-            full_attention_mask = torch.logical_not(causal_attention_mask != 0)
-        
-        attn_output = scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=full_attention_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            scale=self.scale
+            full_attention_mask = causal_attention_mask
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            queries,
+            keys,
+            values,
+            full_attention_mask,
+            dropout=self.dropout if self.training else 0.0,
+            scaling=self.scale,
+            is_causal=False,  # This model uses causal attention masks.
         )
 
-        # reshape back to expected output format
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        
+        # The transpose(1, 2) happens in the attention interface.
+        attn_output = attn_output.reshape(bsz, seq_len, -1).contiguous()
         attn_output = self.out_proj(attn_output)
 
-        return attn_output, None
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights
 
 
 # Copied from transformers.models.clip.modeling_clip.CLIPMLP with CLIP->Owlv2
@@ -524,6 +548,11 @@ class Owlv2PreTrainedModel(PreTrainedModel):
     base_model_prefix = "owlv2"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Owlv2EncoderLayer"]
+
+    _supports_flash_attn_2 = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+    _supports_attention_backend = True
 
     def _init_weights(self, module):
         """Initialize the weights"""
